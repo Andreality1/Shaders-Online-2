@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SDF Uberprism WebGL2</title>
+    <style>
+        body { 
+            margin: 0; 
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+            height: 100vh; 
+            background: #111; 
+        }
+        canvas { 
+            width: 720px; 
+            height: 360px; 
+            background: #000;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+        }
+    </style>
+</head>
+<body>
+
+    <canvas id="glCanvas"></canvas>
+
+    <script id="vs" type="x-shader/x-vertex">
+        #version 300 es
+        in vec4 a_position;
+        void main() {
+            gl_Position = a_position;
+        }
+    </script>
+
+    <script id="fs" type="x-shader/x-fragment">
+        #version 300 es
+        precision highp float;
+
+        uniform float iTime;
+        uniform vec2 iResolution;
+        uniform vec4 iMouse;
+        out vec4 outColor;
+
+        // --- SDF Uberprism Logic ---
+        
+        float sdUnterprim(vec3 p, vec4 s, vec3 r, vec2 ba, float sz2) {
+            vec3 d = abs(p) - s.xyz;
+            float q = length(max(d.xy, 0.0)) + min(0.0,max(d.x,d.y)) - r.x;
+            q = abs(q) - s.w;
+            
+            vec2 pa = vec2(q, p.z - s.z);
+            vec2 diag = pa - vec2(r.z,sz2) * clamp(dot(pa,ba), 0.0, 1.0);
+            vec2 h0 = vec2(max(q - r.z,0.0),p.z + s.z);
+            vec2 h1 = vec2(max(q,0.0),p.z - s.z);
+            
+            return sqrt(min(dot(diag,diag),min(dot(h0,h0),dot(h1,h1))))
+                * sign(max(dot(pa,vec2(-ba.y, ba.x)), d.z)) - r.y;
+        }
+
+        float sdUberprim(vec3 p, vec4 s, vec3 r) {
+            s.xy -= r.x;
+            r.x -= s.w;
+            s.w -= r.y;
+            s.z -= r.y;
+            vec2 ba = vec2(r.z, -2.0*s.z);
+            return sdUnterprim(p, s, r, ba/dot(ba,ba), ba.y);
+        }
+
+        #define SHAPE_COUNT 9.0
+        void getfactor (int i, out vec4 s, out vec3 r) {
+            if (i == 0) { s = vec4(1.0); r = vec3(0.0); } 
+            else if (i == 1) { s = vec4(1.0); r = vec3(1.0,0.0,0.0); } 
+            else if (i == 2) { s = vec4(0.0,0.0,1.0,1.0); r = vec3(0.0,0.0,1.0); } 
+            else if (i == 3) { s = vec4(1.0,1.0,2.0,1.0); r = vec3(1.0,1.0,0.0); } 
+            else if (i == 4) { s = vec4(1.0); r = vec3(1.0,1.0,0.0); } 
+            else if (i == 5) { s = vec4(1.0,1.0,0.25,1.0); r = vec3(1.0,0.25,0.0); } 
+            else if (i == 6) { s = vec4(1.0,1.0,0.25,0.25); r = vec3(1.0,0.25,0.0); } 
+            else if (i == 7) { s = vec4(vec3(1.0),0.25); r = vec3(1.0,0.1,0.0); } 
+            else if (i == 8) { s = vec4(vec3(1.0),0.25); r = vec3(0.1,0.1,0.0); }
+        }
+
+        vec2 min2(vec2 a, vec2 b) { return (a.x <= b.x)?a:b; }
+
+        vec2 doModel( vec3 p ) {
+            float k = iTime*0.5;
+            float u = smoothstep(0.0,1.0,smoothstep(0.0,1.0,fract(k)));
+            int s1 = int(mod(k,SHAPE_COUNT));
+            int s2 = int(mod(k+1.0,SHAPE_COUNT));
+            vec4 sa,sb; vec3 ra,rb;
+            getfactor(s1,sa,ra); getfactor(s2,sb,rb);
+            float d;
+            if (iMouse.z > 0.5) {
+                vec2 m = iMouse.xy/iResolution.xy;
+                d = sdUberprim(p.zyx, vec4(vec3(1.0),mix(sa.w,sb.w,u)), vec3(m, mix(ra,rb,u).z));
+            } else {
+                d = sdUberprim(p.zyx, mix(sa,sb,u), mix(ra,rb,u));
+            }
+            return min2(vec2(p.y+2.0,1.0), vec2(d,0.0));
+        }
+
+        vec3 calcNormal( in vec3 pos ) {
+            const float eps = 0.002;
+            const vec3 v1 = vec3( 1.0,-1.0,-1.0);
+            const vec3 v2 = vec3(-1.0,-1.0, 1.0);
+            const vec3 v3 = vec3(-1.0, 1.0,-1.0);
+            const vec3 v4 = vec3( 1.0, 1.0, 1.0);
+            return normalize( v1*doModel( pos + v1*eps ).x + v2*doModel( pos + v2*eps ).x + v3*doModel( pos + v3*eps ).x + v4*doModel( pos + v4*eps ).x );
+        }
+
+        float calcIntersection( in vec3 ro, in vec3 rd ) {
+            float h = 0.002;
+            float t = 0.01;
+            for( int i=0; i<90; i++ ) {
+                h = doModel( ro+rd*t ).x;
+                if( h<0.001 || t>20.0 ) break;
+                t += h;
+            }
+            return (t<20.0) ? t : -1.0;
+        }
+
+        vec3 ff_filmic_gamma3(vec3 linear) {
+            vec3 x = max(vec3(0.0), linear-0.004);
+            return (x*(x*6.2+0.5))/(x*(x*6.2+1.7)+0.06);
+        }
+
+        void main() {
+            vec2 p = (-iResolution.xy + 2.0*gl_FragCoord.xy)/iResolution.y;
+            vec3 ro = vec3(4.5*sin(iTime*0.2), 2.0, 4.5*cos(iTime*0.2));
+            vec3 ta = vec3(0.0, 0.0, 0.0);
+            
+            vec3 ww = normalize( ta - ro );
+            vec3 uu = normalize( cross(ww, vec3(0.0,1.0,0.0)) );
+            vec3 vv = normalize( cross(uu,ww));
+            vec3 rd = normalize( p.x*uu + p.y*vv + 2.0*ww );
+
+            vec3 col = vec3(0.0);
+            float t = calcIntersection( ro, rd );
+            if( t > 0.0 ) {
+                vec3 pos = ro + t*rd;
+                vec3 nor = calcNormal(pos);
+                float dif = max(0.0, dot(nor, normalize(vec3(1.0,0.7,0.9))));
+                col = vec3(0.1, 0.01, 1.0) * (dif + 0.2);
+            }
+
+            outColor = vec4(ff_filmic_gamma3(col), 1.0);
+        }
+    </script>
+
+    <script>
+        const canvas = document.querySelector("#glCanvas");
+        const gl = canvas.getContext("webgl2");
+
+        // Set specific dimensions
+        canvas.width = 720;
+        canvas.height = 360;
+
+        function createShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error(gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+
+        const vsSource = document.querySelector("#vs").text.trim();
+        const fsSource = document.querySelector("#fs").text.trim();
+        const vertexShader = createShader(gl, gl.VERTEX_SHADER, vsSource);
+        const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+
+        const program = gl.createProgram();
+        gl.attachShader(program, vertexShader);
+        gl.attachShader(program, fragmentShader);
+        gl.linkProgram(program);
+
+        const positions = new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]);
+        const positionBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+
+        const positionLoc = gl.getAttribLocation(program, "a_position");
+        const timeLoc = gl.getUniformLocation(program, "iTime");
+        const resLoc = gl.getUniformLocation(program, "iResolution");
+        const mouseLoc = gl.getUniformLocation(program, "iMouse");
+
+        let mouseX = 0, mouseY = 0, mousePressed = 0;
+        canvas.addEventListener('mousemove', e => {
+            const rect = canvas.getBoundingClientRect();
+            mouseX = e.clientX - rect.left;
+            mouseY = rect.height - (e.clientY - rect.top);
+        });
+        canvas.addEventListener('mousedown', () => mousePressed = 1);
+        canvas.addEventListener('mouseup', () => mousePressed = 0);
+
+        function render(time) {
+            time *= 0.001;
+            gl.viewport(0, 0, canvas.width, canvas.height);
+            gl.useProgram(program);
+            
+            gl.enableVertexAttribArray(positionLoc);
+            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+            gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
+            
+            gl.uniform1f(timeLoc, time);
+            gl.uniform2f(resLoc, canvas.width, canvas.height);
+            gl.uniform4f(mouseLoc, mouseX, mouseY, mousePressed, 0);
+
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+            requestAnimationFrame(render);
+        }
+        requestAnimationFrame(render);
+    </script>
+</body>
+</html>
